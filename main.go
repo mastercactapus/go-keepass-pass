@@ -8,7 +8,7 @@ import (
 	"gopkg.in/alecthomas/kingpin.v1"
 	"io/ioutil"
 	"log"
-	"strconv"
+	"os/exec"
 	"time"
 )
 
@@ -47,6 +47,21 @@ type Group struct {
 	Entries             []Entry `xml:"Entry"`
 	Groups              []Group `xml:"Group"`
 }
+
+type AttrMapRaw []struct {
+	Key   string
+	Value string
+}
+type AttrMap map[string]string
+
+type BinMapRaw []struct {
+	Key   string
+	Value struct {
+		Ref int64 `xml:"Ref,attr"`
+	}
+}
+type BinMap map[string]int64
+
 type Entry struct {
 	UUID   UUID
 	IconID int64
@@ -59,17 +74,9 @@ type Entry struct {
 		UsageCount           int64
 		LocationChanged      time.Time
 	}
-	Attributes []struct {
-		Key   string
-		Value string
-	} `xml:"String"`
-	BinaryAttributes []struct {
-		Key   string
-		Value struct {
-			Ref int64 `xml:"Ref,attr"`
-		}
-	} `xml:"Binary"`
-	AutoType struct {
+	Attributes       AttrMap `xml:"String"`
+	BinaryAttributes BinMap  `xml:"Binary"`
+	AutoType         struct {
 		Enabled                 bool
 		DataTransferObfuscation int64
 	}
@@ -113,8 +120,38 @@ type KeepassDB struct {
 }
 
 var (
-	file = kingpin.Arg("filename", ".xml file to import").Required().File()
+	file     = kingpin.Arg("filename", ".xml file to import").Required().File()
+	topLevel = kingpin.Flag("top-level", "Create top-level directory").Short('t').Default("false").Bool()
 )
+
+func (b *BinMap) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var raw BinMapRaw
+	err := d.DecodeElement(&raw, &start)
+	if err != nil {
+		return err
+	}
+	attrMap := make(BinMap, len(raw))
+	for _, v := range raw {
+		attrMap[v.Key] = v.Value.Ref
+	}
+	*b = attrMap
+	return nil
+}
+
+func (b *AttrMap) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
+	var raw AttrMapRaw
+	err := d.DecodeElement(&raw, &start)
+	if err != nil {
+		return err
+	}
+	if *b == nil {
+		*b = make(AttrMap, len(raw))
+	}
+	for _, v := range raw {
+		(*b)[v.Key] = v.Value
+	}
+	return nil
+}
 
 func (b *BinaryBlob) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error {
 	var raw BinaryBlobRaw
@@ -126,13 +163,15 @@ func (b *BinaryBlob) UnmarshalXML(d *xml.Decoder, start xml.StartElement) error 
 	if err != nil {
 		return err
 	}
-	gread, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	data, err = ioutil.ReadAll(gread)
-	if err != nil {
-		return err
+	if raw.Compressed {
+		gread, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		data, err = ioutil.ReadAll(gread)
+		if err != nil {
+			return err
+		}
 	}
 	*b = BinaryBlob{raw.ID, data}
 	return nil
@@ -168,25 +207,71 @@ func main() {
 	//todo: clean and dump into pass
 
 	for k := range db.Root.Groups {
-		dumpGroup("Root>", &db.Root.Groups[k])
+		var path string
+		if *topLevel {
+			path = db.Root.Groups[k].Name
+		}
+		err := dumpGroup(path, &db.Root.Groups[k], &db)
+		if err != nil {
+			log.Fatalln("Failed while dumping to pass: ", err)
+		}
 	}
 }
 
-func dumpGroup(path string, g *Group) {
-	path = path + ">" + g.Name
+func savePw(path string, data []byte) error {
+	log.Println("Save: " + path)
+	cmd := exec.Command("pass", "insert", "-m", path)
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+
+	_, err = in.Write(data)
+	if err != nil {
+		return err
+	}
+	in.Close()
+	dat, _ := cmd.CombinedOutput()
+	log.Println("Out: " + string(dat))
+
+	return nil
+}
+
+func dumpGroup(path string, g *Group, db *KeepassDB) error {
 	for _, e := range g.Entries {
-		var title string
-		for _, attr := range e.Attributes {
-			if attr.Key == "Title" {
-				title = attr.Value
-				log.Println(path+":", attr.Value)
+		if e.Attributes["Title"] == "" {
+			continue
+		}
+		entryPath := path + "/" + e.Attributes["Title"]
+		var pw string
+		pw = e.Attributes["Password"] + "\n"
+		for name, val := range e.Attributes {
+			if name == "Password" || name == "Title" {
+				continue
+			}
+			if val != "" {
+				pw = pw + name + ": " + val + "\n"
 			}
 		}
-		for _, battr := range e.BinaryAttributes {
-			log.Println(path, ":", title, "{bin["+strconv.Itoa(int(battr.Value.Ref))+"]:", battr.Key+"}")
+		err := savePw(entryPath, []byte(pw))
+		if err != nil {
+			return err
+		}
+
+		for name, ref := range e.BinaryAttributes {
+			binPath := entryPath + "/" + name
+			data := db.Meta.Binaries[ref].Data
+			err := savePw(binPath, data)
+			if err != nil {
+				return err
+			}
 		}
 	}
 	for k := range g.Groups {
-		dumpGroup(path, &g.Groups[k])
+		err := dumpGroup(path+"/"+g.Groups[k].Name, &g.Groups[k], db)
+		if err != nil {
+			return err
+		}
 	}
+	return nil
 }
